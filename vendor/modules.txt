@@ -840,7 +840,7 @@ github.com/spf13/viper/internal/encoding/yaml
 # github.com/status-im/keycard-go v0.0.0-20200402102358-957c09536969
 ## explicit
 github.com/status-im/keycard-go/derivationpath
-# github.com/stretchr/testify v1.8.0
+# github.com/stretchr/testify v1.8.1
 ## explicit; go 1.13
 github.com/stretchr/testify/assert
 github.com/stretchr/testify/require
@@ -1042,7 +1042,7 @@ github.com/zondax/ledger-go
 # go.etcd.io/bbolt v1.3.6
 ## explicit; go 1.12
 go.etcd.io/bbolt
-# go.opencensus.io v0.23.0
+# go.opencensus.io v0.24.0
 ## explicit; go 1.13
 go.opencensus.io
 go.opencensus.io/internal
