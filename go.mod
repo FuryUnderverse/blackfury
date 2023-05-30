@@ -14,7 +14,7 @@ require (
 	github.com/rakyll/statik v0.1.7
 	github.com/spf13/cast v1.5.0
 	github.com/spf13/cobra v1.6.0
-	github.com/stretchr/testify v1.8.0
+	github.com/stretchr/testify v1.8.4
 	github.com/tendermint/tendermint v0.34.24
 	github.com/tendermint/tm-db v0.6.7
 	github.com/tharsis/ethermint v0.8.1
