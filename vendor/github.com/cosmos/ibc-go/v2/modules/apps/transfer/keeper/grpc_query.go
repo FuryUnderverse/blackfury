@@ -3,6 +3,7 @@ package keeper
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -22,9 +23,10 @@ func (q Keeper) DenomTrace(c context.Context, req *types.QueryDenomTraceRequest)
 		return nil, status.Error(codes.InvalidArgument, "empty request")
 	}
 
-	hash, err := types.ParseHexHash(req.Hash)
+	hash, err := types.ParseHexHash(strings.TrimPrefix(req.Hash, "ibc/"))
+
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("invalid denom trace hash %s, %s", req.Hash, err))
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("invalid denom trace hash: %s, error: %s", hash.String(), err))
 	}
 
 	ctx := sdk.UnwrapSDKContext(c)
@@ -79,5 +81,45 @@ func (q Keeper) Params(c context.Context, _ *types.QueryParamsRequest) (*types.Q
 
 	return &types.QueryParamsResponse{
 		Params: &params,
+	}, nil
+}
+
+// DenomHash implements the Query/DenomHash gRPC method
+func (q Keeper) DenomHash(c context.Context, req *types.QueryDenomHashRequest) (*types.QueryDenomHashResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "empty request")
+	}
+
+	// Convert given request trace path to DenomTrace struct to confirm the path in a valid denom trace format
+	denomTrace := types.ParseDenomTrace(req.Trace)
+	if err := denomTrace.Validate(); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	ctx := sdk.UnwrapSDKContext(c)
+	denomHash := denomTrace.Hash()
+	found := q.HasDenomTrace(ctx, denomHash)
+	if !found {
+		return nil, status.Error(
+			codes.NotFound,
+			sdkerrors.Wrap(types.ErrTraceNotFound, req.Trace).Error(),
+		)
+	}
+
+	return &types.QueryDenomHashResponse{
+		Hash: denomHash.String(),
+	}, nil
+}
+
+// EscrowAddress implements the EscrowAddress gRPC method
+func (q Keeper) EscrowAddress(c context.Context, req *types.QueryEscrowAddressRequest) (*types.QueryEscrowAddressResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "empty request")
+	}
+
+	addr := types.GetEscrowAddress(req.PortId, req.ChannelId)
+
+	return &types.QueryEscrowAddressResponse{
+		EscrowAddress: addr.String(),
 	}, nil
 }

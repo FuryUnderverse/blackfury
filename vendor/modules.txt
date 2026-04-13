@@ -116,16 +116,16 @@ github.com/cockroachdb/redact/internal/fmtsort
 # github.com/cockroachdb/sentry-go v0.6.1-cockroachdb.2
 ## explicit; go 1.12
 github.com/cockroachdb/sentry-go
-# github.com/coinbase/rosetta-sdk-go v0.6.10
-## explicit; go 1.13
+# github.com/coinbase/rosetta-sdk-go v0.7.0
+## explicit; go 1.16
 github.com/coinbase/rosetta-sdk-go/asserter
 github.com/coinbase/rosetta-sdk-go/errors
 github.com/coinbase/rosetta-sdk-go/server
 github.com/coinbase/rosetta-sdk-go/types
-# github.com/confio/ics23/go v0.6.6
+# github.com/confio/ics23/go v0.7.0
 ## explicit; go 1.14
 github.com/confio/ics23/go
-# github.com/cosmos/cosmos-sdk v0.44.5-patch => github.com/tharsis/cosmos-sdk v0.44.3-olympus
+# github.com/cosmos/cosmos-sdk v0.45.10 => github.com/tharsis/cosmos-sdk v0.44.3-olympus
 ## explicit; go 1.15
 github.com/cosmos/cosmos-sdk/baseapp
 github.com/cosmos/cosmos-sdk/client
@@ -356,13 +356,16 @@ github.com/cosmos/go-bip39
 # github.com/cosmos/gorocksdb v1.2.0
 ## explicit; go 1.17
 github.com/cosmos/gorocksdb
-# github.com/cosmos/iavl v0.17.2
-## explicit; go 1.13
+# github.com/cosmos/iavl v0.19.3
+## explicit; go 1.18
 github.com/cosmos/iavl
-github.com/cosmos/iavl/common
+github.com/cosmos/iavl/cache
+github.com/cosmos/iavl/internal/bytes
+github.com/cosmos/iavl/internal/encoding
+github.com/cosmos/iavl/internal/logger
 github.com/cosmos/iavl/proto
-# github.com/cosmos/ibc-go/v2 v2.0.4
-## explicit; go 1.15
+# github.com/cosmos/ibc-go/v2 v2.5.0
+## explicit; go 1.18
 github.com/cosmos/ibc-go/v2/modules/apps/transfer
 github.com/cosmos/ibc-go/v2/modules/apps/transfer/client/cli
 github.com/cosmos/ibc-go/v2/modules/apps/transfer/keeper
@@ -577,7 +580,6 @@ github.com/golang/protobuf/protoc-gen-go/descriptor
 github.com/golang/protobuf/ptypes
 github.com/golang/protobuf/ptypes/any
 github.com/golang/protobuf/ptypes/duration
-github.com/golang/protobuf/ptypes/empty
 github.com/golang/protobuf/ptypes/timestamp
 github.com/golang/protobuf/ptypes/wrappers
 # github.com/golang/snappy v0.0.4
@@ -762,8 +764,8 @@ github.com/prometheus/client_golang/prometheus/push
 # github.com/prometheus/client_model v0.2.0
 ## explicit; go 1.9
 github.com/prometheus/client_model/go
-# github.com/prometheus/common v0.32.1
-## explicit; go 1.13
+# github.com/prometheus/common v0.34.0
+## explicit; go 1.15
 github.com/prometheus/common/expfmt
 github.com/prometheus/common/internal/bitbucket.org/ww/goautoneg
 github.com/prometheus/common/model
@@ -1195,7 +1197,6 @@ google.golang.org/protobuf/runtime/protoimpl
 google.golang.org/protobuf/types/descriptorpb
 google.golang.org/protobuf/types/known/anypb
 google.golang.org/protobuf/types/known/durationpb
-google.golang.org/protobuf/types/known/emptypb
 google.golang.org/protobuf/types/known/fieldmaskpb
 google.golang.org/protobuf/types/known/timestamppb
 google.golang.org/protobuf/types/known/wrapperspb

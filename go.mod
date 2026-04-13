@@ -4,8 +4,8 @@ go 1.19
 
 require (
 	contrib.go.opencensus.io/exporter/prometheus v0.4.0
-	github.com/cosmos/cosmos-sdk v0.44.5-patch
-	github.com/cosmos/ibc-go/v2 v2.0.4
+	github.com/cosmos/cosmos-sdk v0.45.10
+	github.com/cosmos/ibc-go/v2 v2.5.0
 	github.com/ethereum/go-ethereum v1.10.11
 	github.com/gogo/protobuf v1.3.3
 	github.com/golang/protobuf v1.5.2
@@ -48,11 +48,11 @@ require (
 	github.com/cockroachdb/pebble v0.0.0-20220726134658-7b78c71e4055 // indirect
 	github.com/cockroachdb/redact v1.0.8 // indirect
 	github.com/cockroachdb/sentry-go v0.6.1-cockroachdb.2 // indirect
-	github.com/coinbase/rosetta-sdk-go v0.6.10 // indirect
-	github.com/confio/ics23/go v0.6.6 // indirect
+	github.com/coinbase/rosetta-sdk-go v0.7.0 // indirect
+	github.com/confio/ics23/go v0.7.0 // indirect
 	github.com/cosmos/go-bip39 v1.0.0 // indirect
 	github.com/cosmos/gorocksdb v1.2.0 // indirect
-	github.com/cosmos/iavl v0.17.2 // indirect
+	github.com/cosmos/iavl v0.19.3 // indirect
 	github.com/cosmos/ledger-cosmos-go v0.11.2-0.20220811092532-036a277666f3 // indirect
 	github.com/creachadair/taskgroup v0.3.2 // indirect
 	github.com/danieljoos/wincred v1.0.2 // indirect
@@ -123,7 +123,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/prometheus/client_golang v1.12.2 // indirect
 	github.com/prometheus/client_model v0.2.0 // indirect
-	github.com/prometheus/common v0.32.1 // indirect
+	github.com/prometheus/common v0.34.0 // indirect
 	github.com/prometheus/procfs v0.8.0 // indirect
 	github.com/prometheus/statsd_exporter v0.21.0 // indirect
 	github.com/prometheus/tsdb v0.10.0 // indirect

@@ -9,8 +9,6 @@ import (
 
 var _ types.MsgServer = Keeper{}
 
-// See createOutgoingPacket in spec:https://github.com/cosmos/ibc/tree/master/spec/app/ics-020-fungible-token-transfer#packet-relay
-
 // Transfer defines a rpc handler method for MsgTransfer.
 func (k Keeper) Transfer(goCtx context.Context, msg *types.MsgTransfer) (*types.MsgTransferResponse, error) {
 	ctx := sdk.UnwrapSDKContext(goCtx)
@@ -19,9 +17,11 @@ func (k Keeper) Transfer(goCtx context.Context, msg *types.MsgTransfer) (*types.
 	if err != nil {
 		return nil, err
 	}
-	if err := k.SendTransfer(
+
+	sequence, err := k.sendTransfer(
 		ctx, msg.SourcePort, msg.SourceChannel, msg.Token, sender, msg.Receiver, msg.TimeoutHeight, msg.TimeoutTimestamp,
-	); err != nil {
+		msg.Memo)
+	if err != nil {
 		return nil, err
 	}
 
@@ -39,5 +39,5 @@ func (k Keeper) Transfer(goCtx context.Context, msg *types.MsgTransfer) (*types.
 		),
 	})
 
-	return &types.MsgTransferResponse{}, nil
+	return &types.MsgTransferResponse{Sequence: sequence}, nil
 }
