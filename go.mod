@@ -1,6 +1,6 @@
 module github.com/tharsis/evmos
 
-go 1.19
+go 1.23
 
 require (
 	contrib.go.opencensus.io/exporter/prometheus v0.4.0
@@ -21,7 +21,7 @@ require (
 	go.opencensus.io v0.23.0
 	google.golang.org/genproto v0.0.0-20221014213838-99cd37c6964a
 	google.golang.org/grpc v1.50.1
-	google.golang.org/protobuf v1.28.2-0.20220831092852-f930b1dc76e8
+	google.golang.org/protobuf v1.36.11
 )
 
 require (
