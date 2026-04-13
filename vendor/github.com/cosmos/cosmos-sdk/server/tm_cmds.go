@@ -6,7 +6,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-//	tcmd "github.com/tendermint/tendermint/cmd/tendermint/commands"
+	tcmd "github.com/tendermint/tendermint/cmd/tendermint/commands"
 	"github.com/tendermint/tendermint/p2p"
 	pvm "github.com/tendermint/tendermint/privval"
 	tversion "github.com/tendermint/tendermint/version"
@@ -117,7 +117,6 @@ against which this app has been compiled.
 }
 
 // UnsafeResetAllCmd - extension of the tendermint command, resets initialization
-/*
 func UnsafeResetAllCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "unsafe-reset-all",
@@ -131,4 +130,3 @@ func UnsafeResetAllCmd() *cobra.Command {
 		},
 	}
 }
-*/
