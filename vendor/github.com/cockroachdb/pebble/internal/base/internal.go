@@ -9,6 +9,17 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/cockroachdb/redact"
+)
+
+const (
+	// SeqNumZero is the zero sequence number, set by compactions if they can
+	// guarantee there are no keys underneath an internal key.
+	SeqNumZero = uint64(0)
+	// SeqNumStart is the first sequence number assigned to a key. Sequence
+	// numbers 1-9 are reserved for potential future use.
+	SeqNumStart = uint64(10)
 )
 
 // InternalKeyKind enumerates the kind of key: a deletion tombstone, a set
@@ -24,6 +35,14 @@ const (
 	//InternalKeyKindColumnFamilyDeletion     InternalKeyKind = 4
 	//InternalKeyKindColumnFamilyValue        InternalKeyKind = 5
 	//InternalKeyKindColumnFamilyMerge        InternalKeyKind = 6
+
+	// InternalKeyKindSingleDelete (SINGLEDEL) is a performance optimization
+	// solely for compactions (to reduce write amp and space amp). Readers other
+	// than compactions should treat SINGLEDEL as equivalent to a DEL.
+	// Historically, it was simpler for readers other than compactions to treat
+	// SINGLEDEL as equivalent to DEL, but as of the introduction of
+	// InternalKeyKindSSTableInternalObsoleteBit, this is also necessary for
+	// correctness.
 	InternalKeyKindSingleDelete InternalKeyKind = 7
 	//InternalKeyKindColumnFamilySingleDelete InternalKeyKind = 8
 	//InternalKeyKindBeginPrepareXID          InternalKeyKind = 9
@@ -60,8 +79,21 @@ const (
 	InternalKeyKindRangeKeyUnset InternalKeyKind = 20
 	InternalKeyKindRangeKeySet   InternalKeyKind = 21
 
-	// This maximum value isn't part of the file format. It's unlikely,
-	// but future extensions may increase this value.
+	// InternalKeyKindIngestSST is used to distinguish a batch that corresponds to
+	// the WAL entry for ingested sstables that are added to the flushable
+	// queue. This InternalKeyKind cannot appear, amongst other key kinds in a
+	// batch, or in an sstable.
+	InternalKeyKindIngestSST InternalKeyKind = 22
+
+	// InternalKeyKindDeleteSized keys behave identically to
+	// InternalKeyKindDelete keys, except that they hold an associated uint64
+	// value indicating the (len(key)+len(value)) of the shadowed entry the
+	// tombstone is expected to delete. This value is used to inform compaction
+	// heuristics, but is not required to be accurate for correctness.
+	InternalKeyKindDeleteSized InternalKeyKind = 23
+
+	// This maximum value isn't part of the file format. Future extensions may
+	// increase this value.
 	//
 	// When constructing an internal key to pass to DB.Seek{GE,LE},
 	// internalKeyComparer sorts decreasing by kind (after sorting increasing by
@@ -69,10 +101,19 @@ const (
 	// which sorts 'less than or equal to' any other valid internalKeyKind, when
 	// searching for any kind of internal key formed by a certain user key and
 	// seqNum.
-	InternalKeyKindMax InternalKeyKind = 21
+	InternalKeyKindMax InternalKeyKind = 23
+
+	// Internal to the sstable format. Not exposed by any sstable iterator.
+	// Declared here to prevent definition of valid key kinds that set this bit.
+	InternalKeyKindSSTableInternalObsoleteBit  InternalKeyKind = 64
+	InternalKeyKindSSTableInternalObsoleteMask InternalKeyKind = 191
+
+	// InternalKeyZeroSeqnumMaxTrailer is the largest trailer with a
+	// zero sequence number.
+	InternalKeyZeroSeqnumMaxTrailer = uint64(255)
 
 	// A marker for an invalid key.
-	InternalKeyKindInvalid InternalKeyKind = 255
+	InternalKeyKindInvalid InternalKeyKind = InternalKeyKindSSTableInternalObsoleteMask
 
 	// InternalKeySeqNumBatch is a bit that is set on batch sequence numbers
 	// which prevents those entries from being excluded from iteration.
@@ -95,6 +136,9 @@ const (
 	InternalKeyBoundaryRangeKey = (InternalKeySeqNumMax << 8) | uint64(InternalKeyKindRangeKeySet)
 )
 
+// Assert InternalKeyKindSSTableInternalObsoleteBit > InternalKeyKindMax
+const _ = uint(InternalKeyKindSSTableInternalObsoleteBit - InternalKeyKindMax - 1)
+
 var internalKeyKindNames = []string{
 	InternalKeyKindDelete:         "DEL",
 	InternalKeyKindSet:            "SET",
@@ -107,6 +151,8 @@ var internalKeyKindNames = []string{
 	InternalKeyKindRangeKeySet:    "RANGEKEYSET",
 	InternalKeyKindRangeKeyUnset:  "RANGEKEYUNSET",
 	InternalKeyKindRangeKeyDelete: "RANGEKEYDEL",
+	InternalKeyKindIngestSST:      "INGESTSST",
+	InternalKeyKindDeleteSized:    "DELSIZED",
 	InternalKeyKindInvalid:        "INVALID",
 }
 
@@ -115,6 +161,11 @@ func (k InternalKeyKind) String() string {
 		return internalKeyKindNames[k]
 	}
 	return fmt.Sprintf("UNKNOWN:%d", k)
+}
+
+// SafeFormat implements redact.SafeFormatter.
+func (k InternalKeyKind) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Print(redact.SafeString(k.String()))
 }
 
 // InternalKey is a key used for the in-memory and on-disk partial DBs that
@@ -183,6 +234,7 @@ var kindsMap = map[string]InternalKeyKind{
 	"DEL":           InternalKeyKindDelete,
 	"SINGLEDEL":     InternalKeyKindSingleDelete,
 	"RANGEDEL":      InternalKeyKindRangeDelete,
+	"LOGDATA":       InternalKeyKindLogData,
 	"SET":           InternalKeyKindSet,
 	"MERGE":         InternalKeyKindMerge,
 	"INVALID":       InternalKeyKindInvalid,
@@ -191,6 +243,8 @@ var kindsMap = map[string]InternalKeyKind{
 	"RANGEKEYSET":   InternalKeyKindRangeKeySet,
 	"RANGEKEYUNSET": InternalKeyKindRangeKeyUnset,
 	"RANGEKEYDEL":   InternalKeyKindRangeKeyDelete,
+	"INGESTSST":     InternalKeyKindIngestSST,
+	"DELSIZED":      InternalKeyKindDeleteSized,
 }
 
 // ParseInternalKey parses the string representation of an internal key. The
@@ -327,16 +381,35 @@ func (k InternalKey) SeqNum() uint64 {
 	return k.Trailer >> 8
 }
 
+// SeqNumFromTrailer returns the sequence number component of a trailer.
+func SeqNumFromTrailer(t uint64) uint64 {
+	return t >> 8
+}
+
 // Visible returns true if the key is visible at the specified snapshot
 // sequence number.
-func (k InternalKey) Visible(snapshot uint64) bool {
-	return Visible(k.SeqNum(), snapshot)
+func (k InternalKey) Visible(snapshot, batchSnapshot uint64) bool {
+	return Visible(k.SeqNum(), snapshot, batchSnapshot)
 }
 
 // Visible returns true if a key with the provided sequence number is visible at
-// the specified snapshot sequence number.
-func Visible(seqNum uint64, snapshot uint64) bool {
-	return seqNum < snapshot || (seqNum&InternalKeySeqNumBatch) != 0
+// the specified snapshot sequence numbers.
+func Visible(seqNum uint64, snapshot, batchSnapshot uint64) bool {
+	// There are two snapshot sequence numbers, one for committed keys and one
+	// for batch keys. If a seqNum is less than `snapshot`, then seqNum
+	// corresponds to a committed key that is visible. If seqNum has its batch
+	// bit set, then seqNum corresponds to an uncommitted batch key. Its
+	// visible if its snapshot is less than batchSnapshot.
+	//
+	// There's one complication. The maximal sequence number
+	// (`InternalKeySeqNumMax`) is used across Pebble for exclusive sentinel
+	// keys and other purposes. The maximal sequence number has its batch bit
+	// set, but it can never be < `batchSnapshot`, since there is no expressible
+	// larger snapshot. We dictate that the maximal sequence number is always
+	// visible.
+	return seqNum < snapshot ||
+		((seqNum&InternalKeySeqNumBatch) != 0 && seqNum < batchSnapshot) ||
+		seqNum == InternalKeySeqNumMax
 }
 
 // SetKind sets the kind component of the key.
@@ -344,9 +417,14 @@ func (k *InternalKey) SetKind(kind InternalKeyKind) {
 	k.Trailer = (k.Trailer &^ 0xff) | uint64(kind)
 }
 
-// Kind returns the kind compoment of the key.
+// Kind returns the kind component of the key.
 func (k InternalKey) Kind() InternalKeyKind {
-	return InternalKeyKind(k.Trailer & 0xff)
+	return TrailerKind(k.Trailer)
+}
+
+// TrailerKind returns the key kind of the key trailer.
+func TrailerKind(trailer uint64) InternalKeyKind {
+	return InternalKeyKind(trailer & 0xff)
 }
 
 // Valid returns true if the key has a valid kind.
@@ -363,6 +441,13 @@ func (k InternalKey) Clone() InternalKey {
 		UserKey: append([]byte(nil), k.UserKey...),
 		Trailer: k.Trailer,
 	}
+}
+
+// CopyFrom converts this InternalKey into a clone of the passed-in InternalKey,
+// reusing any space already used for the current UserKey.
+func (k *InternalKey) CopyFrom(k2 InternalKey) {
+	k.UserKey = append(k.UserKey[:0], k2.UserKey...)
+	k.Trailer = k2.Trailer
 }
 
 // String returns a string representation of the key.
@@ -395,7 +480,11 @@ type prettyInternalKey struct {
 }
 
 func (k prettyInternalKey) Format(s fmt.State, c rune) {
-	fmt.Fprintf(s, "%s#%d,%s", k.formatKey(k.UserKey), k.SeqNum(), k.Kind())
+	if seqNum := k.SeqNum(); seqNum == InternalKeySeqNumMax {
+		fmt.Fprintf(s, "%s#inf,%s", k.formatKey(k.UserKey), k.Kind())
+	} else {
+		fmt.Fprintf(s, "%s#%d,%s", k.formatKey(k.UserKey), k.SeqNum(), k.Kind())
+	}
 }
 
 // ParsePrettyInternalKey parses the pretty string representation of an
@@ -407,6 +496,11 @@ func ParsePrettyInternalKey(s string) InternalKey {
 	if !ok {
 		panic(fmt.Sprintf("unknown kind: %q", x[2]))
 	}
-	seqNum, _ := strconv.ParseUint(x[1], 10, 64)
+	var seqNum uint64
+	if x[1] == "max" || x[1] == "inf" {
+		seqNum = InternalKeySeqNumMax
+	} else {
+		seqNum, _ = strconv.ParseUint(x[1], 10, 64)
+	}
 	return MakeInternalKey([]byte(ukey), seqNum, kind)
 }

@@ -66,6 +66,23 @@ type Separator func(dst, a, b []byte) []byte
 // key must be valid to pass to Compare.
 type Successor func(dst, a []byte) []byte
 
+// ImmediateSuccessor is invoked with a prefix key ([Split(a) == len(a)]) and
+// returns the smallest key that is larger than the given prefix a.
+// ImmediateSuccessor must return a prefix key k such that:
+//
+//	Split(k) == len(k) and Compare(k, a) > 0
+//
+// and there exists no representable k2 such that:
+//
+//	Split(k2) == len(k2) and Compare(k2, a) > 0 and Compare(k2, k) < 0
+//
+// As an example, an implementation built on the natural byte ordering using
+// bytes.Compare could append a `\0` to `a`.
+//
+// The dst parameter may be used to store the returned key, though it is valid
+// to pass nil. The returned key must be valid to pass to Compare.
+type ImmediateSuccessor func(dst, a []byte) []byte
+
 // Split returns the length of the prefix of the user key that corresponds to
 // the key portion of an MVCC encoding scheme to enable the use of prefix bloom
 // filters.
@@ -81,37 +98,37 @@ type Successor func(dst, a []byte) []byte
 //
 // The returned prefix must have the following properties:
 //
-// 1) The prefix must be a byte prefix:
+//  1. The prefix must be a byte prefix:
 //
-//    bytes.HasPrefix(a, prefix(a))
+//     bytes.HasPrefix(a, prefix(a))
 //
-// 2) A key consisting of just a prefix must sort before all other keys with
-//    that prefix:
+//  2. A key consisting of just a prefix must sort before all other keys with
+//     that prefix:
 //
-//    Compare(prefix(a), a) < 0 if len(suffix(a)) > 0
+//     Compare(prefix(a), a) < 0 if len(suffix(a)) > 0
 //
-// 3) Prefixes must be used to order keys before suffixes:
+//  3. Prefixes must be used to order keys before suffixes:
 //
-//    If Compare(a, b) <= 0, then Compare(prefix(a), prefix(b)) <= 0
+//     If Compare(a, b) <= 0, then Compare(prefix(a), prefix(b)) <= 0
 //
-// 4) Suffixes themselves must be valid keys and comparable, respecting the same
-//    ordering as within a key.
+//  4. Suffixes themselves must be valid keys and comparable, respecting the same
+//     ordering as within a key.
 //
-//    If Compare(prefix(a), prefix(b)) == 0, then Compare(suffix(a), suffix(b)) == Compare(a, b)
-//
+//     If Compare(prefix(a), prefix(b)) == 0, then Compare(suffix(a), suffix(b)) == Compare(a, b)
 type Split func(a []byte) int
 
 // Comparer defines a total ordering over the space of []byte keys: a 'less
 // than' relationship.
 type Comparer struct {
-	Compare        Compare
-	Equal          Equal
-	AbbreviatedKey AbbreviatedKey
-	FormatKey      FormatKey
-	FormatValue    FormatValue
-	Separator      Separator
-	Split          Split
-	Successor      Successor
+	Compare            Compare
+	Equal              Equal
+	AbbreviatedKey     AbbreviatedKey
+	FormatKey          FormatKey
+	FormatValue        FormatValue
+	Separator          Separator
+	Split              Split
+	Successor          Successor
+	ImmediateSuccessor ImmediateSuccessor
 
 	// Name is the name of the comparer.
 	//
@@ -191,6 +208,10 @@ var DefaultComparer = &Comparer{
 		}
 		// a is a run of 0xffs, leave it alone.
 		return append(dst, a...)
+	},
+
+	ImmediateSuccessor: func(dst, a []byte) (ret []byte) {
+		return append(append(dst, a...), 0x00)
 	},
 
 	// This name is part of the C++ Level-DB implementation's default file
