@@ -4,7 +4,13 @@
 
 package base
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+
+	"github.com/cockroachdb/pebble/internal/humanize"
+	"github.com/cockroachdb/redact"
+)
 
 // InternalIterator iterates over a DB's key/value pairs in key order. Unlike
 // the Iterator interface, the returned keys are InternalKeys composed of the
@@ -40,7 +46,9 @@ import "fmt"
 // context is not a strict byte prefix, but defined by byte equality for the
 // result of the Comparer.Split method. An InternalIterator is not required to
 // support prefix iteration mode, and can implement SeekPrefixGE by forwarding
-// to SeekGE.
+// to SeekGE. When the iteration prefix is exhausted, it is not valid to call
+// Next on an internal iterator that's already returned (nil,nilv) or a key
+// beyond the prefix.
 //
 // Bounds, [lower, upper), can be set on iterators, either using the SetBounds()
 // function in the interface, or in implementation specific ways during iterator
@@ -85,17 +93,19 @@ import "fmt"
 // them through the Error method. All of the absolute positioning methods
 // reset any accumulated error before positioning. Relative positioning
 // methods return without advancing if the iterator has accumulated an error.
+//
+// nilv == shorthand for LazyValue{}, which represents a nil value.
 type InternalIterator interface {
 	// SeekGE moves the iterator to the first key/value pair whose key is greater
 	// than or equal to the given key. Returns the key and value if the iterator
-	// is pointing at a valid entry, and (nil, nil) otherwise. Note that SeekGE
+	// is pointing at a valid entry, and (nil, nilv) otherwise. Note that SeekGE
 	// only checks the upper bound. It is up to the caller to ensure that key
 	// is greater than or equal to the lower bound.
-	SeekGE(key []byte, flags SeekGEFlags) (*InternalKey, []byte)
+	SeekGE(key []byte, flags SeekGEFlags) (*InternalKey, LazyValue)
 
 	// SeekPrefixGE moves the iterator to the first key/value pair whose key is
 	// greater than or equal to the given key. Returns the key and value if the
-	// iterator is pointing at a valid entry, and (nil, nil) otherwise. Note that
+	// iterator is pointing at a valid entry, and (nil, nilv) otherwise. Note that
 	// SeekPrefixGE only checks the upper bound. It is up to the caller to ensure
 	// that key is greater than or equal to the lower bound.
 	//
@@ -104,7 +114,7 @@ type InternalIterator interface {
 	// function must be supplied to the Comparer for the DB. The supplied prefix
 	// will be the prefix of the given key returned by that Split function. If
 	// the iterator is able to determine that no key with the prefix exists, it
-	// can return (nil,nil). Unlike SeekGE, this is not an indication that
+	// can return (nil,nilv). Unlike SeekGE, this is not an indication that
 	// iteration is exhausted.
 	//
 	// Note that the iterator may return keys not matching the prefix. It is up
@@ -116,52 +126,69 @@ type InternalIterator interface {
 	// not supporting reverse iteration in prefix iteration mode until a
 	// different positioning routine (SeekGE, SeekLT, First or Last) switches the
 	// iterator out of prefix iteration.
-	SeekPrefixGE(prefix, key []byte, flags SeekGEFlags) (*InternalKey, []byte)
+	SeekPrefixGE(prefix, key []byte, flags SeekGEFlags) (*InternalKey, LazyValue)
 
 	// SeekLT moves the iterator to the last key/value pair whose key is less
 	// than the given key. Returns the key and value if the iterator is pointing
-	// at a valid entry, and (nil, nil) otherwise. Note that SeekLT only checks
+	// at a valid entry, and (nil, nilv) otherwise. Note that SeekLT only checks
 	// the lower bound. It is up to the caller to ensure that key is less than
 	// the upper bound.
-	SeekLT(key []byte, flags SeekLTFlags) (*InternalKey, []byte)
+	SeekLT(key []byte, flags SeekLTFlags) (*InternalKey, LazyValue)
 
 	// First moves the iterator the the first key/value pair. Returns the key and
-	// value if the iterator is pointing at a valid entry, and (nil, nil)
+	// value if the iterator is pointing at a valid entry, and (nil, nilv)
 	// otherwise. Note that First only checks the upper bound. It is up to the
 	// caller to ensure that First() is not called when there is a lower bound,
 	// and instead call SeekGE(lower).
-	First() (*InternalKey, []byte)
+	First() (*InternalKey, LazyValue)
 
 	// Last moves the iterator the the last key/value pair. Returns the key and
-	// value if the iterator is pointing at a valid entry, and (nil, nil)
+	// value if the iterator is pointing at a valid entry, and (nil, nilv)
 	// otherwise. Note that Last only checks the lower bound. It is up to the
 	// caller to ensure that Last() is not called when there is an upper bound,
 	// and instead call SeekLT(upper).
-	Last() (*InternalKey, []byte)
+	Last() (*InternalKey, LazyValue)
 
 	// Next moves the iterator to the next key/value pair. Returns the key and
-	// value if the iterator is pointing at a valid entry, and (nil, nil)
+	// value if the iterator is pointing at a valid entry, and (nil, nilv)
 	// otherwise. Note that Next only checks the upper bound. It is up to the
 	// caller to ensure that key is greater than or equal to the lower bound.
 	//
 	// It is valid to call Next when the iterator is positioned before the first
 	// key/value pair due to either a prior call to SeekLT or Prev which returned
-	// (nil, nil). It is not allowed to call Next when the previous call to SeekGE,
-	// SeekPrefixGE or Next returned (nil, nil).
-	Next() (*InternalKey, []byte)
+	// (nil, nilv). It is not allowed to call Next when the previous call to SeekGE,
+	// SeekPrefixGE or Next returned (nil, nilv).
+	Next() (*InternalKey, LazyValue)
+
+	// NextPrefix moves the iterator to the next key/value pair with a different
+	// prefix than the key at the current iterator position. Returns the key and
+	// value if the iterator is pointing at a valid entry, and (nil, nil)
+	// otherwise. Note that NextPrefix only checks the upper bound. It is up to
+	// the caller to ensure that key is greater than or equal to the lower
+	// bound.
+	//
+	// NextPrefix is passed the immediate successor to the current prefix key. A
+	// valid implementation of NextPrefix is to call SeekGE with succKey.
+	//
+	// It is not allowed to call NextPrefix when the previous call was a reverse
+	// positioning operation or a call to a forward positioning method that
+	// returned (nil, nilv). It is also not allowed to call NextPrefix when the
+	// iterator is in prefix iteration mode.
+	NextPrefix(succKey []byte) (*InternalKey, LazyValue)
 
 	// Prev moves the iterator to the previous key/value pair. Returns the key
-	// and value if the iterator is pointing at a valid entry, and (nil, nil)
+	// and value if the iterator is pointing at a valid entry, and (nil, nilv)
 	// otherwise. Note that Prev only checks the lower bound. It is up to the
 	// caller to ensure that key is less than the upper bound.
 	//
 	// It is valid to call Prev when the iterator is positioned after the last
 	// key/value pair due to either a prior call to SeekGE or Next which returned
-	// (nil, nil). It is not allowed to call Prev when the previous call to SeekLT
-	// or Prev returned (nil, nil).
-	Prev() (*InternalKey, []byte)
+	// (nil, nilv). It is not allowed to call Prev when the previous call to SeekLT
+	// or Prev returned (nil, nilv).
+	Prev() (*InternalKey, LazyValue)
 
-	// Error returns any accumulated error.
+	// Error returns any accumulated error. It may not include errors returned
+	// to the client when calling LazyValue.Value().
 	Error() error
 
 	// Close closes the iterator and returns any accumulated error. Exhausting
@@ -190,6 +217,7 @@ type SeekGEFlags uint8
 const (
 	seekGEFlagTrySeekUsingNext uint8 = iota
 	seekGEFlagRelativeSeek
+	seekGEFlagBatchJustRefreshed
 )
 
 // SeekGEFlagsNone is the default value of SeekGEFlags, with all flags disabled.
@@ -234,6 +262,13 @@ func (s SeekGEFlags) TrySeekUsingNext() bool { return (s & (1 << seekGEFlagTrySe
 // iterator position and the new seeked position.
 func (s SeekGEFlags) RelativeSeek() bool { return (s & (1 << seekGEFlagRelativeSeek)) != 0 }
 
+// BatchJustRefreshed is set by Seek[Prefix]GE when an iterator's view of an
+// indexed batch was just refreshed. It serves as a signal to the batch iterator
+// to ignore the TrySeekUsingNext optimization, because the external knowledge
+// imparted by the TrySeekUsingNext flag does not apply to the batch iterator's
+// position. See (pebble.Iterator).batchJustRefreshed.
+func (s SeekGEFlags) BatchJustRefreshed() bool { return (s & (1 << seekGEFlagBatchJustRefreshed)) != 0 }
+
 // EnableTrySeekUsingNext returns the provided flags with the
 // try-seek-using-next optimization enabled. See TrySeekUsingNext for an
 // explanation of this optimization.
@@ -257,6 +292,19 @@ func (s SeekGEFlags) EnableRelativeSeek() SeekGEFlags {
 // disabled.
 func (s SeekGEFlags) DisableRelativeSeek() SeekGEFlags {
 	return s &^ (1 << seekGEFlagRelativeSeek)
+}
+
+// EnableBatchJustRefreshed returns the provided flags with the
+// batch-just-refreshed bit set. See BatchJustRefreshed for an explanation of
+// this flag.
+func (s SeekGEFlags) EnableBatchJustRefreshed() SeekGEFlags {
+	return s | (1 << seekGEFlagBatchJustRefreshed)
+}
+
+// DisableBatchJustRefreshed returns the provided flags with the
+// batch-just-refreshed bit unset.
+func (s SeekGEFlags) DisableBatchJustRefreshed() SeekGEFlags {
+	return s &^ (1 << seekGEFlagBatchJustRefreshed)
 }
 
 // SeekLTFlags holds flags that may configure the behavior of a reverse seek.
@@ -295,25 +343,22 @@ func (s SeekLTFlags) DisableRelativeSeek() SeekLTFlags {
 	return s &^ (1 << seekLTFlagRelativeSeek)
 }
 
-// InternalIteratorWithStats extends InternalIterator to expose stats.
-type InternalIteratorWithStats interface {
-	InternalIterator
-	Stats() InternalIteratorStats
-	ResetStats()
-}
-
 // InternalIteratorStats contains miscellaneous stats produced by
 // InternalIterators that are part of the InternalIterator tree. Not every
 // field is relevant for an InternalIterator implementation. The field values
 // are aggregated as one goes up the InternalIterator tree.
 type InternalIteratorStats struct {
 	// Bytes in the loaded blocks. If the block was compressed, this is the
-	// compressed bytes. Currently, only the second-level index and data blocks
-	// containing points are included.
+	// compressed bytes. Currently, only the index blocks, data blocks
+	// containing points, and filter blocks are included.
 	BlockBytes uint64
 	// Subset of BlockBytes that were in the block cache.
 	BlockBytesInCache uint64
-
+	// BlockReadDuration accumulates the duration spent fetching blocks
+	// due to block cache misses.
+	// TODO(sumeer): this currently excludes the time spent in Reader creation,
+	// and in reading the rangedel and rangekey blocks. Fix that.
+	BlockReadDuration time.Duration
 	// The following can repeatedly count the same points if they are iterated
 	// over multiple times. Additionally, they may count a point twice when
 	// switching directions. The latter could be improved if needed.
@@ -322,7 +367,7 @@ type InternalIteratorStats struct {
 	// included.
 	KeyBytes uint64
 	// Bytes in values that were iterated over. Currently, only point values are
-	// included.
+	// included. For separated values, this is the size of the handle.
 	ValueBytes uint64
 	// The count of points iterated over.
 	PointCount uint64
@@ -330,41 +375,70 @@ type InternalIteratorStats struct {
 	// can be useful for discovering instances of
 	// https://github.com/cockroachdb/pebble/issues/1070.
 	PointsCoveredByRangeTombstones uint64
+
+	// Stats related to points in value blocks encountered during iteration.
+	// These are useful to understand outliers, since typical user facing
+	// iteration should tend to only look at the latest point, and hence have
+	// the following stats close to 0.
+	SeparatedPointValue struct {
+		// Count is a count of points that were in value blocks. This is not a
+		// subset of PointCount: PointCount is produced by mergingIter and if
+		// positioned once, and successful in returning a point, will have a
+		// PointCount of 1, regardless of how many sstables (and memtables etc.)
+		// in the heap got positioned. The count here includes every sstable
+		// iterator that got positioned in the heap.
+		Count uint64
+		// ValueBytes represent the total byte length of the values (in value
+		// blocks) of the points corresponding to Count.
+		ValueBytes uint64
+		// ValueBytesFetched is the total byte length of the values (in value
+		// blocks) that were retrieved.
+		ValueBytesFetched uint64
+	}
 }
 
 // Merge merges the stats in from into the given stats.
 func (s *InternalIteratorStats) Merge(from InternalIteratorStats) {
 	s.BlockBytes += from.BlockBytes
 	s.BlockBytesInCache += from.BlockBytesInCache
+	s.BlockReadDuration += from.BlockReadDuration
 	s.KeyBytes += from.KeyBytes
 	s.ValueBytes += from.ValueBytes
 	s.PointCount += from.PointCount
 	s.PointsCoveredByRangeTombstones += from.PointsCoveredByRangeTombstones
+	s.SeparatedPointValue.Count += from.SeparatedPointValue.Count
+	s.SeparatedPointValue.ValueBytes += from.SeparatedPointValue.ValueBytes
+	s.SeparatedPointValue.ValueBytesFetched += from.SeparatedPointValue.ValueBytesFetched
 }
 
-type internalIteratorWithEmptyStats struct {
-	InternalIterator
+func (s *InternalIteratorStats) String() string {
+	return redact.StringWithoutMarkers(s)
 }
 
-var _ InternalIteratorWithStats = internalIteratorWithEmptyStats{}
-
-// Stats implements InternalIteratorWithStats.
-func (i internalIteratorWithEmptyStats) Stats() InternalIteratorStats {
-	return InternalIteratorStats{}
-}
-
-// ResetStats implements InternalIteratorWithStats.
-func (i internalIteratorWithEmptyStats) ResetStats() {}
-
-// WrapIterWithStats ensures that either iter implements the stats methods or
-// wraps it, such that the return value implements InternalIteratorWithStats.
-func WrapIterWithStats(iter InternalIterator) InternalIteratorWithStats {
-	if iter == nil {
-		return nil
+// SafeFormat implements the redact.SafeFormatter interface.
+func (s *InternalIteratorStats) SafeFormat(p redact.SafePrinter, verb rune) {
+	p.Printf("blocks: %s cached",
+		humanize.Bytes.Uint64(s.BlockBytesInCache),
+	)
+	if s.BlockBytes != s.BlockBytesInCache || s.BlockReadDuration != 0 {
+		p.Printf(", %s not cached (read time: %s)",
+			humanize.Bytes.Uint64(s.BlockBytes-s.BlockBytesInCache),
+			humanize.FormattedString(s.BlockReadDuration.String()),
+		)
 	}
-	i, ok := iter.(InternalIteratorWithStats)
-	if ok {
-		return i
+	p.Printf("; points: %s", humanize.Count.Uint64(s.PointCount))
+
+	if s.PointsCoveredByRangeTombstones != 0 {
+		p.Printf("(%s tombstoned)", humanize.Count.Uint64(s.PointsCoveredByRangeTombstones))
 	}
-	return internalIteratorWithEmptyStats{InternalIterator: iter}
+	p.Printf(" (%s keys, %s values)",
+		humanize.Bytes.Uint64(s.KeyBytes),
+		humanize.Bytes.Uint64(s.ValueBytes),
+	)
+	if s.SeparatedPointValue.Count != 0 {
+		p.Printf("; separated: %s (%s, %s fetched)",
+			humanize.Count.Uint64(s.SeparatedPointValue.Count),
+			humanize.Bytes.Uint64(s.SeparatedPointValue.ValueBytes),
+			humanize.Bytes.Uint64(s.SeparatedPointValue.ValueBytesFetched))
+	}
 }
