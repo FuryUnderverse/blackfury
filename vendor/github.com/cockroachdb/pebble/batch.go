@@ -5,6 +5,7 @@
 package pebble
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/cockroachdb/errors"
@@ -39,10 +41,10 @@ const (
 var ErrNotIndexed = errors.New("pebble: batch not indexed")
 
 // ErrInvalidBatch indicates that a batch is invalid or otherwise corrupted.
-var ErrInvalidBatch = errors.New("pebble: invalid batch")
+var ErrInvalidBatch = base.MarkCorruptionError(errors.New("pebble: invalid batch"))
 
 // ErrBatchTooLarge indicates that a batch is invalid or otherwise corrupted.
-var ErrBatchTooLarge = errors.Newf("pebble: batch too large: >= %s", humanize.Uint64(maxBatchSize))
+var ErrBatchTooLarge = base.MarkCorruptionError(errors.Newf("pebble: batch too large: >= %s", humanize.Bytes.Uint64(maxBatchSize)))
 
 // DeferredBatchOp represents a batch operation (eg. set, merge, delete) that is
 // being inserted into the batch. Indexing is not performed on the specified key
@@ -82,7 +84,7 @@ func (d DeferredBatchOp) Finish() error {
 // consumers should use a batch per goroutine or provide their own
 // synchronization.
 //
-// Indexing
+// # Indexing
 //
 // Batches can be optionally indexed (see DB.NewIndexedBatch). An indexed batch
 // allows iteration via an Iterator (see Batch.NewIter). The iterator provides
@@ -104,7 +106,7 @@ func (d DeferredBatchOp) Finish() error {
 // significantly slower than inserting into a non-indexed batch. Only use an
 // indexed batch if you require reading from it.
 //
-// Atomic commit
+// # Atomic commit
 //
 // The operations in a batch are persisted by calling Batch.Commit which is
 // equivalent to calling DB.Apply(batch). A batch is committed atomically by
@@ -115,7 +117,7 @@ func (d DeferredBatchOp) Finish() error {
 // Batch.Commit will guarantee that the batch is persisted to disk before
 // returning. See commitPipeline for more on the implementation details.
 //
-// Large batches
+// # Large batches
 //
 // The size of a batch is limited only by available memory (be aware that
 // indexed batches require considerably additional memory for the skiplist
@@ -140,34 +142,35 @@ func (d DeferredBatchOp) Finish() error {
 // memtable have the same big-O time, but the constant factor dominates
 // here. Sorting is significantly faster and uses significantly less memory.
 //
-// Internal representation
+// # Internal representation
 //
 // The internal batch representation is a contiguous byte buffer with a fixed
 // 12-byte header, followed by a series of records.
 //
-//   +-------------+------------+--- ... ---+
-//   | SeqNum (8B) | Count (4B) |  Entries  |
-//   +-------------+------------+--- ... ---+
+//	+-------------+------------+--- ... ---+
+//	| SeqNum (8B) | Count (4B) |  Entries  |
+//	+-------------+------------+--- ... ---+
 //
 // Each record has a 1-byte kind tag prefix, followed by 1 or 2 length prefixed
 // strings (varstring):
 //
-//   +-----------+-----------------+-------------------+
-//   | Kind (1B) | Key (varstring) | Value (varstring) |
-//   +-----------+-----------------+-------------------+
+//	+-----------+-----------------+-------------------+
+//	| Kind (1B) | Key (varstring) | Value (varstring) |
+//	+-----------+-----------------+-------------------+
 //
 // A varstring is a varint32 followed by N bytes of data. The Kind tags are
 // exactly those specified by InternalKeyKind. The following table shows the
 // format for records of each kind:
 //
-//   InternalKeyKindDelete         varstring
-//   InternalKeyKindLogData        varstring
-//   InternalKeyKindSet            varstring varstring
-//   InternalKeyKindMerge          varstring varstring
-//   InternalKeyKindRangeDelete    varstring varstring
-//   InternalKeyKindRangeKeySet    varstring varstring
-//   InternalKeyKindRangeKeyUnset  varstring varstring
-//   InternalKeyKindRangeKeyDelete varstring varstring
+//	InternalKeyKindDelete         varstring
+//	InternalKeyKindLogData        varstring
+//	InternalKeyKindIngestSST      varstring
+//	InternalKeyKindSet            varstring varstring
+//	InternalKeyKindMerge          varstring varstring
+//	InternalKeyKindRangeDelete    varstring varstring
+//	InternalKeyKindRangeKeySet    varstring varstring
+//	InternalKeyKindRangeKeyUnset  varstring varstring
+//	InternalKeyKindRangeKeyDelete varstring varstring
 //
 // The intuitive understanding here are that the arguments to Delete, Set,
 // Merge, DeleteRange and RangeKeyDelete are encoded into the batch. The
@@ -180,6 +183,13 @@ func (d DeferredBatchOp) Finish() error {
 // WAL, and thus stable. New record kinds may be added, but the existing ones
 // will not be modified.
 type Batch struct {
+	batchInternal
+	applied atomic.Bool
+}
+
+// batchInternal contains the set of fields within Batch that are non-atomic and
+// capable of being reset using a *b = batchInternal{} struct copy.
+type batchInternal struct {
 	// Data is the wire format of a batch's log entry:
 	//   - 8 bytes for a sequence number of the first batch element,
 	//     or zeroes if the batch has not yet been applied,
@@ -210,6 +220,8 @@ type Batch struct {
 
 	// The db to which the batch will be committed. Do not change this field
 	// after the batch has been created as it might invalidate internal state.
+	// Batch.memTableSize is only refreshed if Batch.db is set. Setting db to
+	// nil once it has been set implies that the Batch has encountered an error.
 	db *DB
 
 	// The count of records in the batch. This count will be stored in the batch
@@ -255,9 +267,95 @@ type Batch struct {
 	// memtable.
 	flushable *flushableBatch
 
+	// minimumFormatMajorVersion indicates the format major version required in
+	// order to commit this batch. If an operation requires a particular format
+	// major version, it ratchets the batch's minimumFormatMajorVersion. When
+	// the batch is committed, this is validated against the database's current
+	// format major version.
+	minimumFormatMajorVersion FormatMajorVersion
+
+	// Synchronous Apply uses the commit WaitGroup for both publishing the
+	// seqnum and waiting for the WAL fsync (if needed). Asynchronous
+	// ApplyNoSyncWait, which implies WriteOptions.Sync is true, uses the commit
+	// WaitGroup for publishing the seqnum and the fsyncWait WaitGroup for
+	// waiting for the WAL fsync.
+	//
+	// TODO(sumeer): if we find that ApplyNoSyncWait in conjunction with
+	// SyncWait is causing higher memory usage because of the time duration
+	// between when the sync is already done, and a goroutine calls SyncWait
+	// (followed by Batch.Close), we could separate out {fsyncWait, commitErr}
+	// into a separate struct that is allocated separately (using another
+	// sync.Pool), and only that struct needs to outlive Batch.Close (which
+	// could then be called immediately after ApplyNoSyncWait). commitStats
+	// will also need to be in this separate struct.
 	commit    sync.WaitGroup
+	fsyncWait sync.WaitGroup
+
+	commitStats BatchCommitStats
+
 	commitErr error
-	applied   uint32 // updated atomically
+
+	// Position bools together to reduce the sizeof the struct.
+
+	// ingestedSSTBatch indicates that the batch contains one or more key kinds
+	// of InternalKeyKindIngestSST. If the batch contains key kinds of IngestSST
+	// then it will only contain key kinds of IngestSST.
+	ingestedSSTBatch bool
+
+	// committing is set to true when a batch begins to commit. It's used to
+	// ensure the batch is not mutated concurrently. It is not an atomic
+	// deliberately, so as to avoid the overhead on batch mutations. This is
+	// okay, because under correct usage this field will never be accessed
+	// concurrently. It's only under incorrect usage the memory accesses of this
+	// variable may violate memory safety. Since we don't use atomics here,
+	// false negatives are possible.
+	committing bool
+}
+
+// BatchCommitStats exposes stats related to committing a batch.
+//
+// NB: there is no Pebble internal tracing (using LoggerAndTracer) of slow
+// batch commits. The caller can use these stats to do their own tracing as
+// needed.
+type BatchCommitStats struct {
+	// TotalDuration is the time spent in DB.{Apply,ApplyNoSyncWait} or
+	// Batch.Commit, plus the time waiting in Batch.SyncWait. If there is a gap
+	// between calling ApplyNoSyncWait and calling SyncWait, that gap could
+	// include some duration in which real work was being done for the commit
+	// and will not be included here. This missing time is considered acceptable
+	// since the goal of these stats is to understand user-facing latency.
+	//
+	// TotalDuration includes time spent in various queues both inside Pebble
+	// and outside Pebble (I/O queues, goroutine scheduler queue, mutex wait
+	// etc.). For some of these queues (which we consider important) the wait
+	// times are included below -- these expose low-level implementation detail
+	// and are meant for expert diagnosis and subject to change. There may be
+	// unaccounted time after subtracting those values from TotalDuration.
+	TotalDuration time.Duration
+	// SemaphoreWaitDuration is the wait time for semaphores in
+	// commitPipeline.Commit.
+	SemaphoreWaitDuration time.Duration
+	// WALQueueWaitDuration is the wait time for allocating memory blocks in the
+	// LogWriter (due to the LogWriter not writing fast enough). At the moment
+	// this is duration is always zero because a single WAL will allow
+	// allocating memory blocks up to the entire memtable size. In the future,
+	// we may pipeline WALs and bound the WAL queued blocks separately, so this
+	// field is preserved for that possibility.
+	WALQueueWaitDuration time.Duration
+	// MemTableWriteStallDuration is the wait caused by a write stall due to too
+	// many memtables (due to not flushing fast enough).
+	MemTableWriteStallDuration time.Duration
+	// L0ReadAmpWriteStallDuration is the wait caused by a write stall due to
+	// high read amplification in L0 (due to not compacting fast enough out of
+	// L0).
+	L0ReadAmpWriteStallDuration time.Duration
+	// WALRotationDuration is the wait time for WAL rotation, which includes
+	// syncing and closing the old WAL and creating (or reusing) a new one.
+	WALRotationDuration time.Duration
+	// CommitWaitDuration is the wait for publishing the seqnum plus the
+	// duration for the WAL sync (if requested). The former should be tiny and
+	// one can assume that this is all due to the WAL sync.
+	CommitWaitDuration time.Duration
 }
 
 var _ Reader = (*Batch)(nil)
@@ -286,6 +384,14 @@ func newBatch(db *DB) *Batch {
 	return b
 }
 
+func newBatchWithSize(db *DB, size int) *Batch {
+	b := newBatch(db)
+	if cap(b.data) < size {
+		b.data = rawalloc.New(0, size)
+	}
+	return b
+}
+
 func newIndexedBatch(db *DB, comparer *Comparer) *Batch {
 	i := indexedBatchPool.Get().(*indexedBatch)
 	i.batch.cmp = comparer.Compare
@@ -295,6 +401,14 @@ func newIndexedBatch(db *DB, comparer *Comparer) *Batch {
 	i.batch.index = &i.index
 	i.batch.index.Init(&i.batch.data, i.batch.cmp, i.batch.abbreviatedKey)
 	return &i.batch
+}
+
+func newIndexedBatchWithSize(db *DB, comparer *Comparer, size int) *Batch {
+	b := newIndexedBatch(db, comparer)
+	if cap(b.data) < size {
+		b.data = rawalloc.New(0, size)
+	}
+	return b
 }
 
 // nextSeqNum returns the batch "sequence number" that will be given to the next
@@ -335,38 +449,59 @@ func (b *Batch) release() {
 	}
 }
 
-func (b *Batch) refreshMemTableSize() {
+func (b *Batch) refreshMemTableSize() error {
 	b.memTableSize = 0
 	if len(b.data) < batchHeaderLen {
-		return
+		return nil
 	}
 
 	b.countRangeDels = 0
 	b.countRangeKeys = 0
+	b.minimumFormatMajorVersion = 0
 	for r := b.Reader(); ; {
-		kind, key, value, ok := r.Next()
+		kind, key, value, ok, err := r.Next()
 		if !ok {
+			if err != nil {
+				return err
+			}
 			break
 		}
-		b.memTableSize += memTableEntrySize(len(key), len(value))
 		switch kind {
 		case InternalKeyKindRangeDelete:
 			b.countRangeDels++
 		case InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete:
 			b.countRangeKeys++
+		case InternalKeyKindDeleteSized:
+			if b.minimumFormatMajorVersion < FormatDeleteSizedAndObsolete {
+				b.minimumFormatMajorVersion = FormatDeleteSizedAndObsolete
+			}
+		case InternalKeyKindIngestSST:
+			if b.minimumFormatMajorVersion < FormatFlushableIngest {
+				b.minimumFormatMajorVersion = FormatFlushableIngest
+			}
+			// This key kind doesn't contribute to the memtable size.
+			continue
 		}
+		b.memTableSize += memTableEntrySize(len(key), len(value))
 	}
+	if b.countRangeKeys > 0 && b.minimumFormatMajorVersion < FormatRangeKeys {
+		b.minimumFormatMajorVersion = FormatRangeKeys
+	}
+	return nil
 }
 
 // Apply the operations contained in the batch to the receiver batch.
 //
 // It is safe to modify the contents of the arguments after Apply returns.
 func (b *Batch) Apply(batch *Batch, _ *WriteOptions) error {
+	if b.ingestedSSTBatch {
+		panic("pebble: invalid batch application")
+	}
 	if len(batch.data) == 0 {
 		return nil
 	}
 	if len(batch.data) < batchHeaderLen {
-		return base.CorruptionErrorf("pebble: invalid batch")
+		return ErrInvalidBatch
 	}
 
 	offset := len(b.data)
@@ -383,8 +518,11 @@ func (b *Batch) Apply(batch *Batch, _ *WriteOptions) error {
 		// order to update the index.
 		for iter := BatchReader(b.data[offset:]); len(iter) > 0; {
 			offset := uintptr(unsafe.Pointer(&iter[0])) - uintptr(unsafe.Pointer(&b.data[0]))
-			kind, key, value, ok := iter.Next()
+			kind, key, value, ok, err := iter.Next()
 			if !ok {
+				if err != nil {
+					return err
+				}
 				break
 			}
 			switch kind {
@@ -392,6 +530,8 @@ func (b *Batch) Apply(batch *Batch, _ *WriteOptions) error {
 				b.countRangeDels++
 			case InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete:
 				b.countRangeKeys++
+			case InternalKeyKindIngestSST:
+				panic("pebble: invalid key kind for batch")
 			}
 			if b.index != nil {
 				var err error
@@ -438,6 +578,9 @@ func (b *Batch) Get(key []byte) ([]byte, io.Closer, error) {
 }
 
 func (b *Batch) prepareDeferredKeyValueRecord(keyLen, valueLen int, kind InternalKeyKind) {
+	if b.committing {
+		panic("pebble: batch already committing")
+	}
 	if len(b.data) == 0 {
 		b.init(keyLen + valueLen + 2*binary.MaxVarintLen64 + batchHeaderLen)
 	}
@@ -487,6 +630,9 @@ func (b *Batch) prepareDeferredKeyValueRecord(keyLen, valueLen int, kind Interna
 }
 
 func (b *Batch) prepareDeferredKeyRecord(keyLen int, kind InternalKeyKind) {
+	if b.committing {
+		panic("pebble: batch already committing")
+	}
 	if len(b.data) == 0 {
 		b.init(keyLen + binary.MaxVarintLen64 + batchHeaderLen)
 	}
@@ -518,6 +664,41 @@ func (b *Batch) prepareDeferredKeyRecord(keyLen int, kind InternalKeyKind) {
 
 	// Shrink data since varint may be shorter than the upper bound.
 	b.data = b.data[:pos+keyLen]
+}
+
+// AddInternalKey allows the caller to add an internal key of point key kinds to
+// a batch. Passing in an internal key of kind RangeKey* or RangeDelete will
+// result in a panic. Note that the seqnum in the internal key is effectively
+// ignored, even though the Kind is preserved. This is because the batch format
+// does not allow for a per-key seqnum to be specified, only a batch-wide one.
+//
+// Note that non-indexed keys (IngestKeyKind{LogData,IngestSST}) are not
+// supported with this method as they require specialized logic.
+func (b *Batch) AddInternalKey(key *base.InternalKey, value []byte, _ *WriteOptions) error {
+	keyLen := len(key.UserKey)
+	hasValue := false
+	switch key.Kind() {
+	case InternalKeyKindRangeDelete, InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete:
+		panic("unexpected range delete or range key kind in AddInternalKey")
+	case InternalKeyKindSingleDelete, InternalKeyKindDelete:
+		b.prepareDeferredKeyRecord(len(key.UserKey), key.Kind())
+	default:
+		b.prepareDeferredKeyValueRecord(keyLen, len(value), key.Kind())
+		hasValue = true
+	}
+	b.deferredOp.index = b.index
+	copy(b.deferredOp.Key, key.UserKey)
+	if hasValue {
+		copy(b.deferredOp.Value, value)
+	}
+	// TODO(peter): Manually inline DeferredBatchOp.Finish(). Mid-stack inlining
+	// in go1.13 will remove the need for this.
+	if b.index != nil {
+		if err := b.index.Add(b.deferredOp.offset); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Set adds an action to the batch that sets the key to map to the value.
@@ -599,6 +780,72 @@ func (b *Batch) Delete(key []byte, _ *WriteOptions) error {
 func (b *Batch) DeleteDeferred(keyLen int) *DeferredBatchOp {
 	b.prepareDeferredKeyRecord(keyLen, InternalKeyKindDelete)
 	b.deferredOp.index = b.index
+	return &b.deferredOp
+}
+
+// DeleteSized behaves identically to Delete, but takes an additional
+// argument indicating the size of the value being deleted. DeleteSized
+// should be preferred when the caller has the expectation that there exists
+// a single internal KV pair for the key (eg, the key has not been
+// overwritten recently), and the caller knows the size of its value.
+//
+// DeleteSized will record the value size within the tombstone and use it to
+// inform compaction-picking heuristics which strive to reduce space
+// amplification in the LSM. This "calling your shot" mechanic allows the
+// storage engine to more accurately estimate and reduce space amplification.
+//
+// It is safe to modify the contents of the arguments after DeleteSized
+// returns.
+func (b *Batch) DeleteSized(key []byte, deletedValueSize uint32, _ *WriteOptions) error {
+	deferredOp := b.DeleteSizedDeferred(len(key), deletedValueSize)
+	copy(b.deferredOp.Key, key)
+	// TODO(peter): Manually inline DeferredBatchOp.Finish(). Check if in a
+	// later Go release this is unnecessary.
+	if b.index != nil {
+		if err := b.index.Add(deferredOp.offset); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeleteSizedDeferred is similar to DeleteSized in that it adds a sized delete
+// operation to the batch, except it only takes in key length instead of a
+// complete key slice, letting the caller encode into the DeferredBatchOp.Key
+// slice and then call Finish() on the returned object.
+func (b *Batch) DeleteSizedDeferred(keyLen int, deletedValueSize uint32) *DeferredBatchOp {
+	if b.minimumFormatMajorVersion < FormatDeleteSizedAndObsolete {
+		b.minimumFormatMajorVersion = FormatDeleteSizedAndObsolete
+	}
+
+	// Encode the sum of the key length and the value in the value.
+	v := uint64(deletedValueSize) + uint64(keyLen)
+
+	// Encode `v` as a varint.
+	var buf [binary.MaxVarintLen64]byte
+	n := 0
+	{
+		x := v
+		for x >= 0x80 {
+			buf[n] = byte(x) | 0x80
+			x >>= 7
+			n++
+		}
+		buf[n] = byte(x)
+		n++
+	}
+
+	// NB: In batch entries and sstable entries, values are stored as
+	// varstrings. Here, the value is itself a simple varint. This results in an
+	// unnecessary double layer of encoding:
+	//     varint(n) varint(deletedValueSize)
+	// The first varint will always be 1-byte, since a varint-encoded uint64
+	// will never exceed 128 bytes. This unnecessary extra byte and wrapping is
+	// preserved to avoid special casing across the database, and in particular
+	// in sstable block decoding which is performance sensitive.
+	b.prepareDeferredKeyValueRecord(keyLen, n, InternalKeyKindDeleteSized)
+	b.deferredOp.index = b.index
+	copy(b.deferredOp.Value, buf[:n])
 	return &b.deferredOp
 }
 
@@ -704,6 +951,9 @@ func (b *Batch) rangeKeySetDeferred(startLen, internalValueLen int) *DeferredBat
 
 func (b *Batch) incrementRangeKeysCount() {
 	b.countRangeKeys++
+	if b.minimumFormatMajorVersion < FormatRangeKeys {
+		b.minimumFormatMajorVersion = FormatRangeKeys
+	}
 	if b.index != nil {
 		b.rangeKeys = nil
 		b.rangeKeysSeqNum = 0
@@ -797,6 +1047,29 @@ func (b *Batch) LogData(data []byte, _ *WriteOptions) error {
 	return nil
 }
 
+// IngestSST adds the FileNum for an sstable to the batch. The data will only be
+// written to the WAL (not added to memtables or sstables).
+func (b *Batch) ingestSST(fileNum base.FileNum) {
+	if b.Empty() {
+		b.ingestedSSTBatch = true
+	} else if !b.ingestedSSTBatch {
+		// Batch contains other key kinds.
+		panic("pebble: invalid call to ingestSST")
+	}
+
+	origMemTableSize := b.memTableSize
+	var buf [binary.MaxVarintLen64]byte
+	length := binary.PutUvarint(buf[:], uint64(fileNum))
+	b.prepareDeferredKeyRecord(length, InternalKeyKindIngestSST)
+	copy(b.deferredOp.Key, buf[:length])
+	// Since IngestSST writes only to the WAL and does not affect the memtable,
+	// we restore b.memTableSize to its original value. Note that Batch.count
+	// is not reset because for the InternalKeyKindIngestSST the count is the
+	// number of sstable paths which have been added to the batch.
+	b.memTableSize = origMemTableSize
+	b.minimumFormatMajorVersion = FormatFlushableIngest
+}
+
 // Empty returns true if the batch is empty, and false otherwise.
 func (b *Batch) Empty() bool {
 	return len(b.data) <= batchHeaderLen
@@ -830,11 +1103,12 @@ func (b *Batch) SetRepr(data []byte) error {
 	}
 	b.data = data
 	b.count = uint64(binary.LittleEndian.Uint32(b.countData()))
+	var err error
 	if b.db != nil {
 		// Only track memTableSize for batches that will be committed to the DB.
-		b.refreshMemTableSize()
+		err = b.refreshMemTableSize()
 	}
-	return nil
+	return err
 }
 
 // NewIter returns an iterator that is unpositioned (Iterator.Valid() will
@@ -844,27 +1118,54 @@ func (b *Batch) SetRepr(data []byte) error {
 // The returned Iterator observes all of the Batch's existing mutations, but no
 // later mutations. Its view can be refreshed via RefreshBatchSnapshot or
 // SetOptions().
-func (b *Batch) NewIter(o *IterOptions) *Iterator {
+func (b *Batch) NewIter(o *IterOptions) (*Iterator, error) {
+	return b.NewIterWithContext(context.Background(), o), nil
+}
+
+// NewIterWithContext is like NewIter, and additionally accepts a context for
+// tracing.
+func (b *Batch) NewIterWithContext(ctx context.Context, o *IterOptions) *Iterator {
 	if b.index == nil {
 		return &Iterator{err: ErrNotIndexed}
 	}
-	return b.db.newIterInternal(b, nil /* snapshot */, o)
+	return b.db.newIter(ctx, b, snapshotIterOpts{}, o)
 }
 
 // newInternalIter creates a new internalIterator that iterates over the
 // contents of the batch.
 func (b *Batch) newInternalIter(o *IterOptions) *batchIter {
 	iter := &batchIter{}
-	b.initInternalIter(o, iter, b.nextSeqNum())
+	b.initInternalIter(o, iter)
 	return iter
 }
 
-func (b *Batch) initInternalIter(o *IterOptions, iter *batchIter, batchSnapshot uint64) {
+func (b *Batch) initInternalIter(o *IterOptions, iter *batchIter) {
 	*iter = batchIter{
-		cmp:      b.cmp,
-		batch:    b,
-		iter:     b.index.NewIter(o.GetLowerBound(), o.GetUpperBound()),
-		snapshot: batchSnapshot,
+		cmp:   b.cmp,
+		batch: b,
+		iter:  b.index.NewIter(o.GetLowerBound(), o.GetUpperBound()),
+		// NB: We explicitly do not propagate the batch snapshot to the point
+		// key iterator. Filtering point keys within the batch iterator can
+		// cause pathological behavior where a batch iterator advances
+		// significantly farther than necessary filtering many batch keys that
+		// are not visible at the batch sequence number. Instead, the merging
+		// iterator enforces bounds.
+		//
+		// For example, consider an engine that contains the committed keys
+		// 'bar' and 'bax', with no keys between them. Consider a batch
+		// containing keys 1,000 keys within the range [a,z]. All of the
+		// batch keys were added to the batch after the iterator was
+		// constructed, so they are not visible to the iterator. A call to
+		// SeekGE('bax') would seek the LSM iterators and discover the key
+		// 'bax'. It would also seek the batch iterator, landing on the key
+		// 'baz' but discover it that it's not visible. The batch iterator would
+		// next through the rest of the batch's keys, only to discover there are
+		// no visible keys greater than or equal to 'bax'.
+		//
+		// Filtering these batch points within the merging iterator ensures that
+		// the batch iterator never needs to iterate beyond 'baz', because it
+		// already found a smaller, visible key 'bax'.
+		snapshot: base.InternalKeySeqNumMax,
 	}
 }
 
@@ -934,7 +1235,7 @@ func fragmentRangeDels(frag *keyspan.Fragmenter, it internalIterator, count int)
 	// individual []keyspan.Key slices with a single element each.
 	keyBuf := make([]keyspan.Key, 0, count)
 	for key, val := it.First(); key != nil; key, val = it.Next() {
-		s := rangedel.Decode(*key, val, keyBuf)
+		s := rangedel.Decode(*key, val.InPlaceValue(), keyBuf)
 		keyBuf = s.Keys[len(s.Keys):]
 
 		// Set a fixed capacity to avoid accidental overwriting.
@@ -1009,7 +1310,7 @@ func fragmentRangeKeys(frag *keyspan.Fragmenter, it internalIterator, count int)
 	// individual []keyspan.Key slices with a single element each.
 	keyBuf := make([]keyspan.Key, 0, count)
 	for ik, val := it.First(); ik != nil; ik, val = it.Next() {
-		s, err := rangekey.Decode(*ik, val, keyBuf)
+		s, err := rangekey.Decode(*ik, val.InPlaceValue(), keyBuf)
 		if err != nil {
 			return err
 		}
@@ -1040,36 +1341,40 @@ func (b *Batch) Indexed() bool {
 	return b.index != nil
 }
 
-func (b *Batch) init(cap int) {
+// init ensures that the batch data slice is initialized to meet the
+// minimum required size and allocates space for the batch header.
+func (b *Batch) init(size int) {
 	n := batchInitialSize
-	for n < cap {
+	for n < size {
 		n *= 2
 	}
-	b.data = rawalloc.New(batchHeaderLen, n)
-	b.setCount(0)
-	b.setSeqNum(0)
+	if cap(b.data) < n {
+		b.data = rawalloc.New(batchHeaderLen, n)
+	}
 	b.data = b.data[:batchHeaderLen]
+	// Zero the sequence number in the header.
+	for i := 0; i < len(b.data); i++ {
+		b.data[i] = 0
+	}
 }
 
 // Reset resets the batch for reuse. The underlying byte slice (that is
-// returned by Repr()) is not modified. It is only necessary to call this
+// returned by Repr()) may not be modified. It is only necessary to call this
 // method if a batch is explicitly being reused. Close automatically takes are
 // of releasing resources when appropriate for batches that are internally
 // being reused.
 func (b *Batch) Reset() {
-	b.count = 0
-	b.countRangeDels = 0
-	b.countRangeKeys = 0
-	b.memTableSize = 0
-	b.deferredOp = DeferredBatchOp{}
-	b.tombstones = nil
-	b.tombstonesSeqNum = 0
-	b.rangeKeys = nil
-	b.rangeKeysSeqNum = 0
-	b.flushable = nil
-	b.commit = sync.WaitGroup{}
-	b.commitErr = nil
-	atomic.StoreUint32(&b.applied, 0)
+	// Zero out the struct, retaining only the fields necessary for manual
+	// reuse.
+	b.batchInternal = batchInternal{
+		data:           b.data,
+		cmp:            b.cmp,
+		formatKey:      b.formatKey,
+		abbreviatedKey: b.abbreviatedKey,
+		index:          b.index,
+		db:             b.db,
+	}
+	b.applied.Store(false)
 	if b.data != nil {
 		if cap(b.data) > batchMaxRetainedSize {
 			// If the capacity of the buffer is larger than our maximum
@@ -1080,13 +1385,14 @@ func (b *Batch) Reset() {
 		} else {
 			// Otherwise, reset the buffer for re-use.
 			b.data = b.data[:batchHeaderLen]
-			b.setSeqNum(0)
+			// Zero the sequence number in the header.
+			for i := 0; i < len(b.data); i++ {
+				b.data[i] = 0
+			}
 		}
 	}
 	if b.index != nil {
 		b.index.Init(&b.data, b.cmp, b.abbreviatedKey)
-		b.rangeDelIndex = nil
-		b.rangeKeyIndex = nil
 	}
 }
 
@@ -1138,7 +1444,9 @@ func (b *Batch) setCount(v uint32) {
 }
 
 // Count returns the count of memtable-modifying operations in this batch. All
-// operations with the except of LogData increment this count.
+// operations with the except of LogData increment this count. For IngestSSTs,
+// count is only used to indicate the number of SSTs ingested in the record, the
+// batch isn't applied to the memtable.
 func (b *Batch) Count() uint32 {
 	if b.count > math.MaxUint32 {
 		panic(ErrInvalidBatch)
@@ -1156,6 +1464,11 @@ func (b *Batch) Reader() BatchReader {
 }
 
 func batchDecodeStr(data []byte) (odata []byte, s []byte, ok bool) {
+	// TODO(jackson): This will index out of bounds if there's no varint or an
+	// invalid varint (eg, a single 0xff byte). Correcting will add a bit of
+	// overhead. We could avoid that overhead whenever len(data) >=
+	// binary.MaxVarint32?
+
 	var v uint32
 	var n int
 	ptr := unsafe.Pointer(&data[0])
@@ -1184,6 +1497,26 @@ func batchDecodeStr(data []byte) (odata []byte, s []byte, ok bool) {
 	return data[v:], data[:v], true
 }
 
+// SyncWait is to be used in conjunction with DB.ApplyNoSyncWait.
+func (b *Batch) SyncWait() error {
+	now := time.Now()
+	b.fsyncWait.Wait()
+	if b.commitErr != nil {
+		b.db = nil // prevent batch reuse on error
+	}
+	waitDuration := time.Since(now)
+	b.commitStats.CommitWaitDuration += waitDuration
+	b.commitStats.TotalDuration += waitDuration
+	return b.commitErr
+}
+
+// CommitStats returns stats related to committing the batch. Should be called
+// after Batch.Commit, DB.Apply. If DB.ApplyNoSyncWait is used, should be
+// called after Batch.SyncWait.
+func (b *Batch) CommitStats() BatchCommitStats {
+	return b.commitStats
+}
+
 // BatchReader iterates over the entries contained in a batch.
 type BatchReader []byte
 
@@ -1198,29 +1531,32 @@ func ReadBatch(repr []byte) (r BatchReader, count uint32) {
 	return repr[batchHeaderLen:], count
 }
 
-// Next returns the next entry in this batch. The final return value is false
-// if the batch is corrupt. The end of batch is reached when len(r)==0.
-func (r *BatchReader) Next() (kind InternalKeyKind, ukey []byte, value []byte, ok bool) {
+// Next returns the next entry in this batch, if there is one. If the reader has
+// reached the end of the batch, Next returns ok=false and a nil error. If the
+// batch is corrupt and the next entry is illegible, Next returns ok=false and a
+// non-nil error.
+func (r *BatchReader) Next() (kind InternalKeyKind, ukey []byte, value []byte, ok bool, err error) {
 	if len(*r) == 0 {
-		return 0, nil, nil, false
+		return 0, nil, nil, false, nil
 	}
 	kind = InternalKeyKind((*r)[0])
 	if kind > InternalKeyKindMax {
-		return 0, nil, nil, false
+		return 0, nil, nil, false, errors.Wrapf(ErrInvalidBatch, "invalid key kind 0x%x", (*r)[0])
 	}
 	*r, ukey, ok = batchDecodeStr((*r)[1:])
 	if !ok {
-		return 0, nil, nil, false
+		return 0, nil, nil, false, errors.Wrapf(ErrInvalidBatch, "decoding user key")
 	}
 	switch kind {
 	case InternalKeyKindSet, InternalKeyKindMerge, InternalKeyKindRangeDelete,
-		InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete:
+		InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete,
+		InternalKeyKindDeleteSized:
 		*r, value, ok = batchDecodeStr(*r)
 		if !ok {
-			return 0, nil, nil, false
+			return 0, nil, nil, false, errors.Wrapf(ErrInvalidBatch, "decoding %s value", kind)
 		}
 	}
-	return kind, ukey, value, true
+	return kind, ukey, value, true, nil
 }
 
 // Note: batchIter mirrors the implementation of flushableBatchIter. Keep the
@@ -1244,90 +1580,102 @@ func (i *batchIter) String() string {
 	return "batch"
 }
 
-func (i *batchIter) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, []byte) {
-	// Ignore trySeekUsingNext since the batch may have changed, so using Next
-	// would be incorrect.
+func (i *batchIter) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, base.LazyValue) {
+	// Ignore TrySeekUsingNext if the view of the batch changed.
+	if flags.TrySeekUsingNext() && flags.BatchJustRefreshed() {
+		flags = flags.DisableTrySeekUsingNext()
+	}
+
 	i.err = nil // clear cached iteration error
-	ikey := i.iter.SeekGE(key)
+	ikey := i.iter.SeekGE(key, flags)
 	for ikey != nil && ikey.SeqNum() >= i.snapshot {
 		ikey = i.iter.Next()
 	}
 	if ikey == nil {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
-	return ikey, i.Value()
+	return ikey, base.MakeInPlaceValue(i.value())
 }
 
 func (i *batchIter) SeekPrefixGE(
 	prefix, key []byte, flags base.SeekGEFlags,
-) (*base.InternalKey, []byte) {
+) (*base.InternalKey, base.LazyValue) {
 	i.err = nil // clear cached iteration error
 	return i.SeekGE(key, flags)
 }
 
-func (i *batchIter) SeekLT(key []byte, flags base.SeekLTFlags) (*InternalKey, []byte) {
+func (i *batchIter) SeekLT(key []byte, flags base.SeekLTFlags) (*InternalKey, base.LazyValue) {
 	i.err = nil // clear cached iteration error
 	ikey := i.iter.SeekLT(key)
 	for ikey != nil && ikey.SeqNum() >= i.snapshot {
 		ikey = i.iter.Prev()
 	}
 	if ikey == nil {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
-	return ikey, i.Value()
+	return ikey, base.MakeInPlaceValue(i.value())
 }
 
-func (i *batchIter) First() (*InternalKey, []byte) {
+func (i *batchIter) First() (*InternalKey, base.LazyValue) {
 	i.err = nil // clear cached iteration error
 	ikey := i.iter.First()
 	for ikey != nil && ikey.SeqNum() >= i.snapshot {
 		ikey = i.iter.Next()
 	}
 	if ikey == nil {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
-	return ikey, i.Value()
+	return ikey, base.MakeInPlaceValue(i.value())
 }
 
-func (i *batchIter) Last() (*InternalKey, []byte) {
+func (i *batchIter) Last() (*InternalKey, base.LazyValue) {
 	i.err = nil // clear cached iteration error
 	ikey := i.iter.Last()
 	for ikey != nil && ikey.SeqNum() >= i.snapshot {
 		ikey = i.iter.Prev()
 	}
 	if ikey == nil {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
-	return ikey, i.Value()
+	return ikey, base.MakeInPlaceValue(i.value())
 }
 
-func (i *batchIter) Next() (*InternalKey, []byte) {
+func (i *batchIter) Next() (*InternalKey, base.LazyValue) {
 	ikey := i.iter.Next()
 	for ikey != nil && ikey.SeqNum() >= i.snapshot {
 		ikey = i.iter.Next()
 	}
 	if ikey == nil {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
-	return ikey, i.Value()
+	return ikey, base.MakeInPlaceValue(i.value())
 }
 
-func (i *batchIter) Prev() (*InternalKey, []byte) {
+func (i *batchIter) NextPrefix(succKey []byte) (*InternalKey, LazyValue) {
+	// Because NextPrefix was invoked `succKey` must be ≥ the key at i's current
+	// position. Seek the arena iterator using TrySeekUsingNext.
+	ikey := i.iter.SeekGE(succKey, base.SeekGEFlagsNone.EnableTrySeekUsingNext())
+	for ikey != nil && ikey.SeqNum() >= i.snapshot {
+		ikey = i.iter.Next()
+	}
+	if ikey == nil {
+		return nil, base.LazyValue{}
+	}
+	return ikey, base.MakeInPlaceValue(i.value())
+}
+
+func (i *batchIter) Prev() (*InternalKey, base.LazyValue) {
 	ikey := i.iter.Prev()
 	for ikey != nil && ikey.SeqNum() >= i.snapshot {
 		ikey = i.iter.Prev()
 	}
 	if ikey == nil {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
-	return ikey, i.Value()
+	return ikey, base.MakeInPlaceValue(i.value())
 }
 
-func (i *batchIter) Key() *InternalKey {
-	return i.iter.Key()
-}
-
-func (i *batchIter) Value() []byte {
+func (i *batchIter) value() []byte {
 	offset, _, keyEnd := i.iter.KeyInfo()
 	data := i.batch.data
 	if len(data[offset:]) == 0 {
@@ -1337,7 +1685,8 @@ func (i *batchIter) Value() []byte {
 
 	switch InternalKeyKind(data[offset]) {
 	case InternalKeyKindSet, InternalKeyKindMerge, InternalKeyKindRangeDelete,
-		InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete:
+		InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete,
+		InternalKeyKindDeleteSized:
 		_, value, ok := batchDecodeStr(data[keyEnd:])
 		if !ok {
 			return nil
@@ -1346,10 +1695,6 @@ func (i *batchIter) Value() []byte {
 	default:
 		return nil
 	}
-}
-
-func (i *batchIter) Valid() bool {
-	return i.iter.Valid()
 }
 
 func (i *batchIter) Error() error {
@@ -1413,7 +1758,7 @@ var _ flushable = (*flushableBatch)(nil)
 // interface. This allows the batch to act like a memtable and be placed in the
 // queue of flushable memtables. Note that the flushable batch takes ownership
 // of the batch data.
-func newFlushableBatch(batch *Batch, comparer *Comparer) *flushableBatch {
+func newFlushableBatch(batch *Batch, comparer *Comparer) (*flushableBatch, error) {
 	b := &flushableBatch{
 		data:      batch.data,
 		cmp:       comparer.Compare,
@@ -1434,8 +1779,11 @@ func newFlushableBatch(batch *Batch, comparer *Comparer) *flushableBatch {
 		var index uint32
 		for iter := BatchReader(b.data[batchHeaderLen:]); len(iter) > 0; index++ {
 			offset := uintptr(unsafe.Pointer(&iter[0])) - uintptr(unsafe.Pointer(&b.data[0]))
-			kind, key, _, ok := iter.Next()
+			kind, key, _, ok, err := iter.Next()
 			if !ok {
+				if err != nil {
+					return nil, err
+				}
 				break
 			}
 			entry := flushableBatchEntry{
@@ -1507,7 +1855,7 @@ func newFlushableBatch(batch *Batch, comparer *Comparer) *flushableBatch {
 		}
 		fragmentRangeKeys(frag, it, len(rangeKeyOffsets))
 	}
-	return b
+	return b, nil
 }
 
 func (b *flushableBatch) setSeqNum(seqNum uint64) {
@@ -1556,6 +1904,7 @@ func (b *flushableBatch) Swap(i, j int) {
 	b.offsets[i], b.offsets[j] = b.offsets[j], b.offsets[i]
 }
 
+// newIter is part of the flushable interface.
 func (b *flushableBatch) newIter(o *IterOptions) internalIterator {
 	return &flushableBatchIter{
 		batch:   b,
@@ -1568,6 +1917,7 @@ func (b *flushableBatch) newIter(o *IterOptions) internalIterator {
 	}
 }
 
+// newFlushIter is part of the flushable interface.
 func (b *flushableBatch) newFlushIter(o *IterOptions, bytesFlushed *uint64) internalIterator {
 	return &flushFlushableBatchIter{
 		flushableBatchIter: flushableBatchIter{
@@ -1581,6 +1931,7 @@ func (b *flushableBatch) newFlushIter(o *IterOptions, bytesFlushed *uint64) inte
 	}
 }
 
+// newRangeDelIter is part of the flushable interface.
 func (b *flushableBatch) newRangeDelIter(o *IterOptions) keyspan.FragmentIterator {
 	if len(b.tombstones) == 0 {
 		return nil
@@ -1588,6 +1939,7 @@ func (b *flushableBatch) newRangeDelIter(o *IterOptions) keyspan.FragmentIterato
 	return keyspan.NewIter(b.cmp, b.tombstones)
 }
 
+// newRangeKeyIter is part of the flushable interface.
 func (b *flushableBatch) newRangeKeyIter(o *IterOptions) keyspan.FragmentIterator {
 	if len(b.rangeKeys) == 0 {
 		return nil
@@ -1595,17 +1947,23 @@ func (b *flushableBatch) newRangeKeyIter(o *IterOptions) keyspan.FragmentIterato
 	return keyspan.NewIter(b.cmp, b.rangeKeys)
 }
 
+// containsRangeKeys is part of the flushable interface.
 func (b *flushableBatch) containsRangeKeys() bool { return len(b.rangeKeys) > 0 }
 
+// inuseBytes is part of the flushable interface.
 func (b *flushableBatch) inuseBytes() uint64 {
 	return uint64(len(b.data) - batchHeaderLen)
 }
 
+// totalBytes is part of the flushable interface.
 func (b *flushableBatch) totalBytes() uint64 {
 	return uint64(cap(b.data))
 }
 
+// readyForFlush is part of the flushable interface.
 func (b *flushableBatch) readyForFlush() bool {
+	// A flushable batch is always ready for flush; it must be flushed together
+	// with the previous memtable.
 	return true
 }
 
@@ -1642,34 +2000,38 @@ func (i *flushableBatchIter) String() string {
 // SeekGE implements internalIterator.SeekGE, as documented in the pebble
 // package. Ignore flags.TrySeekUsingNext() since we don't expect this
 // optimization to provide much benefit here at the moment.
-func (i *flushableBatchIter) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, []byte) {
+func (i *flushableBatchIter) SeekGE(
+	key []byte, flags base.SeekGEFlags,
+) (*InternalKey, base.LazyValue) {
 	i.err = nil // clear cached iteration error
 	ikey := base.MakeSearchKey(key)
 	i.index = sort.Search(len(i.offsets), func(j int) bool {
 		return base.InternalCompare(i.cmp, ikey, i.getKey(j)) <= 0
 	})
 	if i.index >= len(i.offsets) {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
 	i.key = i.getKey(i.index)
 	if i.upper != nil && i.cmp(i.key.UserKey, i.upper) >= 0 {
 		i.index = len(i.offsets)
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
-	return &i.key, i.Value()
+	return &i.key, i.value()
 }
 
 // SeekPrefixGE implements internalIterator.SeekPrefixGE, as documented in the
 // pebble package.
 func (i *flushableBatchIter) SeekPrefixGE(
 	prefix, key []byte, flags base.SeekGEFlags,
-) (*base.InternalKey, []byte) {
+) (*base.InternalKey, base.LazyValue) {
 	return i.SeekGE(key, flags)
 }
 
 // SeekLT implements internalIterator.SeekLT, as documented in the pebble
 // package.
-func (i *flushableBatchIter) SeekLT(key []byte, flags base.SeekLTFlags) (*InternalKey, []byte) {
+func (i *flushableBatchIter) SeekLT(
+	key []byte, flags base.SeekLTFlags,
+) (*InternalKey, base.LazyValue) {
 	i.err = nil // clear cached iteration error
 	ikey := base.MakeSearchKey(key)
 	i.index = sort.Search(len(i.offsets), func(j int) bool {
@@ -1677,80 +2039,86 @@ func (i *flushableBatchIter) SeekLT(key []byte, flags base.SeekLTFlags) (*Intern
 	})
 	i.index--
 	if i.index < 0 {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
 	i.key = i.getKey(i.index)
 	if i.lower != nil && i.cmp(i.key.UserKey, i.lower) < 0 {
 		i.index = -1
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
-	return &i.key, i.Value()
+	return &i.key, i.value()
 }
 
 // First implements internalIterator.First, as documented in the pebble
 // package.
-func (i *flushableBatchIter) First() (*InternalKey, []byte) {
+func (i *flushableBatchIter) First() (*InternalKey, base.LazyValue) {
 	i.err = nil // clear cached iteration error
 	if len(i.offsets) == 0 {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
 	i.index = 0
 	i.key = i.getKey(i.index)
 	if i.upper != nil && i.cmp(i.key.UserKey, i.upper) >= 0 {
 		i.index = len(i.offsets)
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
-	return &i.key, i.Value()
+	return &i.key, i.value()
 }
 
 // Last implements internalIterator.Last, as documented in the pebble
 // package.
-func (i *flushableBatchIter) Last() (*InternalKey, []byte) {
+func (i *flushableBatchIter) Last() (*InternalKey, base.LazyValue) {
 	i.err = nil // clear cached iteration error
 	if len(i.offsets) == 0 {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
 	i.index = len(i.offsets) - 1
 	i.key = i.getKey(i.index)
 	if i.lower != nil && i.cmp(i.key.UserKey, i.lower) < 0 {
 		i.index = -1
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
-	return &i.key, i.Value()
+	return &i.key, i.value()
 }
 
 // Note: flushFlushableBatchIter.Next mirrors the implementation of
 // flushableBatchIter.Next due to performance. Keep the two in sync.
-func (i *flushableBatchIter) Next() (*InternalKey, []byte) {
+func (i *flushableBatchIter) Next() (*InternalKey, base.LazyValue) {
 	if i.index == len(i.offsets) {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
 	i.index++
 	if i.index == len(i.offsets) {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
 	i.key = i.getKey(i.index)
 	if i.upper != nil && i.cmp(i.key.UserKey, i.upper) >= 0 {
 		i.index = len(i.offsets)
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
-	return &i.key, i.Value()
+	return &i.key, i.value()
 }
 
-func (i *flushableBatchIter) Prev() (*InternalKey, []byte) {
+func (i *flushableBatchIter) Prev() (*InternalKey, base.LazyValue) {
 	if i.index < 0 {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
 	i.index--
 	if i.index < 0 {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
 	i.key = i.getKey(i.index)
 	if i.lower != nil && i.cmp(i.key.UserKey, i.lower) < 0 {
 		i.index = -1
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
-	return &i.key, i.Value()
+	return &i.key, i.value()
+}
+
+// Note: flushFlushableBatchIter.NextPrefix mirrors the implementation of
+// flushableBatchIter.NextPrefix due to performance. Keep the two in sync.
+func (i *flushableBatchIter) NextPrefix(succKey []byte) (*InternalKey, LazyValue) {
+	return i.SeekGE(succKey, base.SeekGEFlagsNone.EnableTrySeekUsingNext())
 }
 
 func (i *flushableBatchIter) getKey(index int) InternalKey {
@@ -1760,34 +2128,31 @@ func (i *flushableBatchIter) getKey(index int) InternalKey {
 	return base.MakeInternalKey(key, i.batch.seqNum+uint64(e.index), kind)
 }
 
-func (i *flushableBatchIter) Key() *InternalKey {
-	return &i.key
-}
-
-func (i *flushableBatchIter) Value() []byte {
+func (i *flushableBatchIter) value() base.LazyValue {
 	p := i.data[i.offsets[i.index].offset:]
 	if len(p) == 0 {
 		i.err = base.CorruptionErrorf("corrupted batch")
-		return nil
+		return base.LazyValue{}
 	}
 	kind := InternalKeyKind(p[0])
 	if kind > InternalKeyKindMax {
 		i.err = base.CorruptionErrorf("corrupted batch")
-		return nil
+		return base.LazyValue{}
 	}
 	var value []byte
 	var ok bool
 	switch kind {
 	case InternalKeyKindSet, InternalKeyKindMerge, InternalKeyKindRangeDelete,
-		InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete:
+		InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete,
+		InternalKeyKindDeleteSized:
 		keyEnd := i.offsets[i.index].keyEnd
 		_, value, ok = batchDecodeStr(i.data[keyEnd:])
 		if !ok {
 			i.err = base.CorruptionErrorf("corrupted batch")
-			return nil
+			return base.LazyValue{}
 		}
 	}
-	return value
+	return base.MakeInPlaceValue(value)
 }
 
 func (i *flushableBatchIter) Valid() bool {
@@ -1823,50 +2188,54 @@ func (i *flushFlushableBatchIter) String() string {
 
 func (i *flushFlushableBatchIter) SeekGE(
 	key []byte, flags base.SeekGEFlags,
-) (*InternalKey, []byte) {
+) (*InternalKey, base.LazyValue) {
 	panic("pebble: SeekGE unimplemented")
 }
 
 func (i *flushFlushableBatchIter) SeekPrefixGE(
 	prefix, key []byte, flags base.SeekGEFlags,
-) (*base.InternalKey, []byte) {
+) (*base.InternalKey, base.LazyValue) {
 	panic("pebble: SeekPrefixGE unimplemented")
 }
 
 func (i *flushFlushableBatchIter) SeekLT(
 	key []byte, flags base.SeekLTFlags,
-) (*InternalKey, []byte) {
+) (*InternalKey, base.LazyValue) {
 	panic("pebble: SeekLT unimplemented")
 }
 
-func (i *flushFlushableBatchIter) First() (*InternalKey, []byte) {
+func (i *flushFlushableBatchIter) First() (*InternalKey, base.LazyValue) {
 	i.err = nil // clear cached iteration error
 	key, val := i.flushableBatchIter.First()
 	if key == nil {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
 	entryBytes := i.offsets[i.index].keyEnd - i.offsets[i.index].offset
 	*i.bytesIterated += uint64(entryBytes) + i.valueSize()
 	return key, val
 }
 
+func (i *flushFlushableBatchIter) NextPrefix(succKey []byte) (*InternalKey, base.LazyValue) {
+	panic("pebble: Prev unimplemented")
+}
+
 // Note: flushFlushableBatchIter.Next mirrors the implementation of
 // flushableBatchIter.Next due to performance. Keep the two in sync.
-func (i *flushFlushableBatchIter) Next() (*InternalKey, []byte) {
+func (i *flushFlushableBatchIter) Next() (*InternalKey, base.LazyValue) {
 	if i.index == len(i.offsets) {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
 	i.index++
 	if i.index == len(i.offsets) {
-		return nil, nil
+		return nil, base.LazyValue{}
 	}
 	i.key = i.getKey(i.index)
 	entryBytes := i.offsets[i.index].keyEnd - i.offsets[i.index].offset
 	*i.bytesIterated += uint64(entryBytes) + i.valueSize()
-	return &i.key, i.Value()
+	return &i.key, i.value()
 }
 
-func (i flushFlushableBatchIter) Prev() (*InternalKey, []byte) {
+func (i flushFlushableBatchIter) Prev() (*InternalKey, base.LazyValue) {
 	panic("pebble: Prev unimplemented")
 }
 
@@ -1912,7 +2281,10 @@ func batchSort(
 		rangeKeyIter := b.newRangeKeyIter(nil, math.MaxUint64)
 		return pointIter, rangeDelIter, rangeKeyIter
 	}
-	f := newFlushableBatch(b, b.db.opts.Comparer)
+	f, err := newFlushableBatch(b, b.db.opts.Comparer)
+	if err != nil {
+		panic(err)
+	}
 	return f.newIter(nil), f.newRangeDelIter(nil), f.newRangeKeyIter(nil)
 }
 
